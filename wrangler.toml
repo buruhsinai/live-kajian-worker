@@ -16,3 +16,4 @@ SUPABASE_URL = "https://mxucxnpccndtqvihgcwq.supabase.co"
 SUPABASE_ANON_KEY = "sb_publishable_8tRsjLV8rXmg1nhp5psD-Q_aXoIXWJ2"   # kunci publik yang sama dengan js/auth-config.js
 ALLOWED_ORIGINS = "https://qiladat.com,https://www.qiladat.com"        # tambahkan alamat uji bila perlu
 MAX_PENDENGAR = "80"
+MAKS_TOTAL_MB = "300"      # batas total gambar halaman per sesi (MB)
