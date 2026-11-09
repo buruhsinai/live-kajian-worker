@@ -11,7 +11,19 @@
           /alat-siar?s=<id sesi>    pengajar mengirim peristiwa alat peraga (JSON teks; token sama seperti /siar)
           /alat-dengar?s=<id sesi>  penonton menerima peristiwa alat peraga (tanpa login; dibatasi MAX_PENDENGAR)
           /dengar dan /alat-dengar juga wajib &k=<kunci penonton 32 heks> yang punya kursi (Fase 3, supabase-live-kursi.sql); KURSI_WAJIB=off mematikan pemeriksaan.
-          Yang lewat saluran alat hanya peristiwa kecil (klik, nilai slider, gerak penunjuk), TIDAK PERNAH kode atau isi alat. */
+          Yang lewat saluran alat hanya peristiwa kecil (klik, nilai slider, gerak penunjuk, gulir), TIDAK PERNAH kode atau isi alat —
+          kecuali pengajar sengaja menyalakan "alat terkunci tampil untuk umum" (v8, lihat /alat-isi di bawah).
+          Pesan kendali di saluran alat (v8, mode kunci):
+            {t:'mode', a:bool, b:bool}              a = kunci kitab (halaman+gulir), b = kunci alat; disimpan untuk penonton yang masuk terlambat
+            {t:'umum', v:bool}                      izinkan alat terkunci tampil untuk peserta non-anggota
+            {t:'kg', h, x, y, v?, f?}               posisi kitab pengajar: halaman h (1..2000), gulir x/y (0..1), v = kunci kitab; hanya f=1 (final) yang disimpan
+            {t:'e', k:'s', p, x, y, f?, n}          gulir di dalam alat (p '' = dokumen); hanya f=1 yang disimpan, satu per elemen
+            {t:'isi', n}                            (dari relay ke penonton) isi alat terkunci sudah dititipkan
+          /alat-isi?s=<sesi>&n=<nonce alat>[&k=<kunci kursi>]
+              GET     penonton (wajib kursi) mengambil HTML alat terkunci; hanya bila umum menyala dan n = alat yang sedang dibuka
+              POST    pengajar menitipkan HTML alat terkunci (Authorization: Bearer; maks 4 MB; disimpan per potongan 900 KB)
+              DELETE  pengajar menghapus titipan
+          Titipan dihapus saat alat ditutup/diganti, umum dimatikan, kajian diakhiri, dan otomatis 12 jam sesudahnya. */
 import { DurableObject } from 'cloudflare:workers';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -22,8 +34,10 @@ const MAKS_HALAMAN = 2000;
 const UMUR_GAMBAR = 12 * 3600 * 1000;  // ms sejak unggahan terakhir
 const MAKS_PESAN_ALAT = 4096;         // karakter per peristiwa alat
 const MAKS_LOG_ALAT = 300;            // peristiwa yang diingat untuk penonton yang masuk terlambat
-const SIMPAN_ALAT = { i: 1, c: 1, d: 1, u: 1, pd: 1, pu: 1, md: 1, mu: 1, td: 1, tu: 1, pm: 1, mm: 1, tm: 1 };   // jenis yang disimpan: nilai kontrol (hanya yang terakhir per elemen), klik, tombol, tekan/lepas penunjuk. Gerak (pm/mm/tm) hanya disimpan saat menyeret, dan hanya titik terakhir tiap seretan.
-const JENIS_ALAT = /^(i|c|d|u|pd|pm|pu|md|mm|mu|td|tm|tu)$/;
+const MAKS_ISI = 4000000;             // byte HTML alat terkunci yang dititipkan (v8)
+const CHUNK_ISI = 900000;             // byte per baris SQLite (batas baris DO = 2 MB)
+const SIMPAN_ALAT = { i: 1, c: 1, d: 1, u: 1, pd: 1, pu: 1, md: 1, mu: 1, td: 1, tu: 1, pm: 1, mm: 1, tm: 1, s: 1 };   // jenis yang disimpan: nilai kontrol (hanya yang terakhir per elemen), klik, tombol, tekan/lepas penunjuk. Gerak (pm/mm/tm) hanya disimpan saat menyeret, dan hanya titik terakhir tiap seretan. Gulir (s): hanya posisi akhir (f=1) per elemen.
+const JENIS_ALAT = /^(i|c|d|u|pd|pm|pu|md|mm|mu|td|tm|tu|s)$/;
 
 function tolak(status, teks) { return new Response(teks, { status }); }
 function daftarAsal(env) { return (env.ALLOWED_ORIGINS || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean); }
@@ -31,7 +45,7 @@ function asalBoleh(env, req) { const a = daftarAsal(env); return !a.length || a.
 /* tambahkan header CORS untuk asal yang diizinkan (dipakai oleh unggah dari studio) */
 function denganCors(env, req, res) {
   const r = new Response(res.body, res), o = req.headers.get('Origin');
-  if (o && daftarAsal(env).indexOf(o) >= 0) { r.headers.set('Access-Control-Allow-Origin', o); r.headers.append('Vary', 'Origin'); }
+  if (o && (daftarAsal(env).indexOf(o) >= 0 || !daftarAsal(env).length)) { r.headers.set('Access-Control-Allow-Origin', o); r.headers.append('Vary', 'Origin'); }   // daftar kosong = tanpa batasan (uji lokal): pantulkan asal
   r.headers.set('Cross-Origin-Resource-Policy', 'cross-origin');
   return r;
 }
@@ -99,11 +113,39 @@ async function gambarRute(req, env, u) {
   return balas(await stub.fetch(req));
 }
 
+/* v8: isi HTML alat terkunci yang dititipkan pengajar agar tampil juga untuk peserta non-anggota */
+async function isiRute(req, env, u) {
+  const sesi = u.searchParams.get('s'), n = u.searchParams.get('n');
+  if (req.method === 'OPTIONS') {
+    if (!asalBoleh(env, req)) return tolak(403, 'Origin tidak diizinkan');
+    return denganCors(env, req, new Response(null, { status: 204, headers: {
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS', 'Access-Control-Allow-Headers': 'authorization, content-type', 'Access-Control-Max-Age': '86400' } }));
+  }
+  const balas = function (res) { return denganCors(env, req, res); };
+  if (!sesi || !UUID.test(sesi)) return balas(tolak(400, 'Sesi tidak valid'));
+  if (!n || !KUNCI.test(n)) return balas(tolak(400, 'Parameter tidak valid'));
+  if (!asalBoleh(env, req)) return balas(tolak(403, 'Origin tidak diizinkan'));
+  const stub = env.RUANG.get(env.RUANG.idFromName(sesi));
+  if (req.method === 'GET') {
+    const k = u.searchParams.get('k') || '';
+    if (env.KURSI_WAJIB !== 'off' && !KUNCI.test(k)) return balas(tolak(403, 'Tidak punya kursi'));
+    if (!(await kursiSah(env, sesi, k))) return balas(tolak(403, 'Tidak punya kursi'));
+    return balas(await stub.fetch(req));
+  }
+  if (req.method !== 'POST' && req.method !== 'DELETE') return balas(tolak(405, 'Metode tidak didukung'));
+  const m = /^Bearer (.+)$/.exec(req.headers.get('Authorization') || '');
+  if (!m) return balas(tolak(401, 'Butuh token'));
+  if (!(await pengajarSah(env, m[1], sesi))) return balas(tolak(403, 'Ditolak: bukan pengajar, atau sesi tidak sedang live'));
+  if (req.method === 'POST' && Number(req.headers.get('Content-Length')) > MAKS_ISI) return balas(tolak(413, 'Isi alat terlalu besar'));
+  return balas(await stub.fetch(req));
+}
+
 export default {
   async fetch(req, env) {
     const u = new URL(req.url);
     if (u.pathname === '/') return new Response('live-kajian relay ok');
     if (u.pathname === '/gambar') return gambarRute(req, env, u);
+    if (u.pathname === '/alat-isi') return isiRute(req, env, u);
     if (req.headers.get('Upgrade') !== 'websocket') return tolak(426, 'Butuh WebSocket');
     if (!asalBoleh(env, req)) return tolak(403, 'Origin tidak diizinkan');
     const sesi = u.searchParams.get('s');
@@ -134,6 +176,30 @@ export class Ruang extends DurableObject {
     this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS halaman (v TEXT NOT NULL, n INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (v, n))');
     this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS alat_log (id INTEGER PRIMARY KEY AUTOINCREMENT, kunci TEXT, data TEXT NOT NULL)');
     this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS alat_meta (k TEXT PRIMARY KEY, v TEXT)');
+    this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS alat_isi (n TEXT NOT NULL, i INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (n, i))');
+  }
+
+  /* ---- isi alat terkunci yang dititipkan (v8) ---- */
+  async isi(req, u) {
+    const sql = this.ctx.storage.sql, n = u.searchParams.get('n');
+    if (req.method === 'GET') {
+      if (this.meta('umum') !== '1' || n !== this.nonceAlat()) return new Response('tidak ada', { status: 404, headers: { 'Cache-Control': 'no-store' } });
+      const baris = sql.exec('SELECT data FROM alat_isi WHERE n = ? ORDER BY i', n).toArray();
+      if (!baris.length) return new Response('belum ada', { status: 404, headers: { 'Cache-Control': 'no-store' } });
+      const bagian = baris.map(function (r) { return new Uint8Array(r.data); }), total = bagian.reduce(function (a, b) { return a + b.length; }, 0), out = new Uint8Array(total);
+      let o = 0; bagian.forEach(function (b) { out.set(b, o); o += b.length; });
+      return new Response(out, { headers: { 'Content-Type': 'text/plain; charset=utf-8', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' } });
+    }
+    if (req.method === 'DELETE') { sql.exec('DELETE FROM alat_isi'); return new Response('dihapus'); }
+    if (n !== this.nonceAlat()) return tolak(409, 'Itu bukan alat yang sedang dibuka');
+    const b = new Uint8Array(await req.arrayBuffer());
+    if (b.length > MAKS_ISI) return tolak(413, 'Isi alat terlalu besar');
+    if (b.length < 16) return tolak(400, 'Isi alat kosong');
+    sql.exec('DELETE FROM alat_isi');
+    for (let i = 0, j = 0; i < b.length; i += CHUNK_ISI, j++) sql.exec('INSERT INTO alat_isi (n, i, data) VALUES (?, ?, ?)', n, j, b.slice(i, i + CHUNK_ISI).buffer);
+    await this.ctx.storage.setAlarm(Date.now() + UMUR_GAMBAR);
+    this.siarAlat(JSON.stringify({ t: 'isi', n }));
+    return new Response('ok');
   }
 
   /* gambar halaman kitab: satu kitab (kunci v) pada satu waktu; kitab baru menghapus yang lama */
@@ -157,15 +223,38 @@ export class Ruang extends DurableObject {
     return new Response('ok');
   }
 
-  async alarm() { this.ctx.storage.sql.exec('DELETE FROM halaman'); this.ctx.storage.sql.exec('DELETE FROM alat_log'); this.ctx.storage.sql.exec('DELETE FROM alat_meta'); }
+  async alarm() { const s = this.ctx.storage.sql; s.exec('DELETE FROM halaman'); s.exec('DELETE FROM alat_log'); s.exec('DELETE FROM alat_meta'); s.exec('DELETE FROM alat_isi'); }
 
   /* ---- saluran alat peraga ---- */
-  nonceAlat() { const r = this.ctx.storage.sql.exec("SELECT v FROM alat_meta WHERE k = 'n'").toArray(); return r.length ? r[0].v : null; }
+  meta(k) { const r = this.ctx.storage.sql.exec('SELECT v FROM alat_meta WHERE k = ?', k).toArray(); return r.length ? r[0].v : null; }
+  setMeta(k, v) { this.ctx.storage.sql.exec('INSERT OR REPLACE INTO alat_meta (k, v) VALUES (?, ?)', k, v); }
+  metaJson(k) { try { return JSON.parse(this.meta(k)); } catch (e) { return null; } }
+  nonceAlat() { return this.meta('n'); }
 
   keadaanAlat() {
     const n = this.nonceAlat();
     if (!n) return { t: 'mulai', n: null, log: [] };
     return { t: 'mulai', n, log: this.ctx.storage.sql.exec('SELECT data FROM alat_log ORDER BY id').toArray().map(function (r) { return r.data; }) };
+  }
+
+  /* untuk penonton yang baru tersambung: log alat + mode kunci + posisi kitab + izin umum */
+  keadaanLengkap() {
+    const k = this.keadaanAlat();
+    k.mode = this.metaJson('mode'); k.kg = this.metaJson('kg'); k.umum = this.meta('umum') === '1';
+    return k;
+  }
+
+  /* simpan satu peristiwa ke log (kunci = pemadatan: yang lama dengan kunci sama dibuang); kembalikan teks dengan nomor urut q */
+  catat(kunci, j) {
+    const sql = this.ctx.storage.sql;
+    if (kunci) sql.exec('DELETE FROM alat_log WHERE kunci = ?', kunci);
+    sql.exec('INSERT INTO alat_log (kunci, data) VALUES (?, ?)', kunci, JSON.stringify(j));
+    const id = sql.exec('SELECT last_insert_rowid() AS id').one().id;
+    j.q = id; const str = JSON.stringify(j);                                           // nomor urut: penonton yang sempat putus meminta yang tertinggal
+    sql.exec('UPDATE alat_log SET data = ? WHERE id = ?', str, id);
+    sql.exec('DELETE FROM alat_log WHERE id <= (SELECT MAX(id) FROM alat_log) - ?', MAKS_LOG_ALAT);
+    this.ctx.storage.setAlarm(Date.now() + UMUR_GAMBAR);
+    return str;
   }
 
   siarAlat(str) { this.buka('al').forEach(function (w) { try { w.send(str); } catch (e) { } }); }
@@ -176,19 +265,41 @@ export class Ruang extends DurableObject {
     let j; try { j = JSON.parse(str); } catch (e) { return; }
     if (!j || typeof j !== 'object') return;
     const sql = this.ctx.storage.sql;
+    if (j.t === 'mode') {   // kunci kitab (a) dan kunci alat (b)
+      if (typeof j.a !== 'boolean' || typeof j.b !== 'boolean') return;
+      this.setMeta('mode', JSON.stringify({ a: j.a, b: j.b })); this.siarAlat(JSON.stringify({ t: 'mode', a: j.a, b: j.b })); return;
+    }
+    if (j.t === 'umum') {   // alat terkunci boleh tampil untuk non-anggota; dimatikan = titipan dihapus
+      if (typeof j.v !== 'boolean') return;
+      this.setMeta('umum', j.v ? '1' : '0'); if (!j.v) sql.exec('DELETE FROM alat_isi');
+      this.siarAlat(JSON.stringify({ t: 'umum', v: j.v })); return;
+    }
+    if (j.t === 'kg') {     // posisi kitab pengajar; hanya yang final disimpan (supaya tulisan SQL jarang)
+      if (!Number.isInteger(j.h) || j.h < 1 || j.h > MAKS_HALAMAN || !(typeof j.x === 'number' && j.x >= 0 && j.x <= 1) || !(typeof j.y === 'number' && j.y >= 0 && j.y <= 1)) return;
+      if (j.v !== undefined && (typeof j.v !== 'string' || !KUNCI.test(j.v))) return;
+      const o = { t: 'kg', h: j.h, x: j.x, y: j.y }; if (j.v !== undefined) o.v = j.v;
+      if (j.f === 1) { this.setMeta('kg', JSON.stringify({ h: o.h, x: o.x, y: o.y, v: o.v })); o.f = 1; this.ctx.storage.setAlarm(Date.now() + UMUR_GAMBAR); }
+      this.siarAlat(JSON.stringify(o)); return;
+    }
     if (j.t === 'baru' || j.t === 'tutup') {
       if (j.t === 'baru' && (typeof j.n !== 'string' || !KUNCI.test(j.n))) return;
       sql.exec('DELETE FROM alat_log');
       if (j.t === 'baru') {
-        sql.exec("INSERT OR REPLACE INTO alat_meta (k, v) VALUES ('n', ?)", j.n);
+        if (j.n !== this.nonceAlat()) sql.exec('DELETE FROM alat_isi');     // alat lain: titipan lama tidak berlaku
+        this.setMeta('n', j.n);
         this.siarAlat(JSON.stringify({ t: 'baru', n: j.n }));
       } else {
-        sql.exec("DELETE FROM alat_meta WHERE k = 'n'");
+        sql.exec("DELETE FROM alat_meta WHERE k = 'n'"); sql.exec('DELETE FROM alat_isi');
         this.siarAlat(JSON.stringify({ t: 'tutup' }));
       }
       return;
     }
     if (j.t !== 'e' || typeof j.k !== 'string' || !JENIS_ALAT.test(j.k) || typeof j.n !== 'string' || j.n !== this.nonceAlat()) return;   // hanya untuk alat yang sedang dibuka
+    if (j.k === 's') {      // gulir di dalam alat: pecahan 0..1 per elemen; hanya posisi akhir (f=1) disimpan
+      if (typeof j.p !== 'string' || j.p.length > 200 || !(typeof j.x === 'number' && j.x >= 0 && j.x <= 1) || !(typeof j.y === 'number' && j.y >= 0 && j.y <= 1)) return;
+      if (j.f === 1) str = this.catat('s|' + j.p, j);
+      this.siarAlat(str); return;
+    }
     if (SIMPAN_ALAT[j.k]) {
       const gerak = j.k === 'pm' || j.k === 'mm' || j.k === 'tm';
       if (gerak && j.k !== 'tm' && !((j.s | 0) > 0)) { this.siarAlat(str); return; }      // gerak tanpa tombol ditekan = melayang saja, tidak disimpan
@@ -197,12 +308,7 @@ export class Ruang extends DurableObject {
       else if (gerak && typeof j.p === 'string') kunci = 'g|' + j.k + '|' + j.p;
       if (kunci) sql.exec('DELETE FROM alat_log WHERE kunci = ?', kunci);
       if (!gerak) sql.exec("UPDATE alat_log SET kunci = NULL WHERE kunci LIKE 'g|%'");   // seretan sebelumnya selesai: titik terakhirnya dibekukan
-      sql.exec('INSERT INTO alat_log (kunci, data) VALUES (?, ?)', kunci, str);
-      const id = sql.exec('SELECT last_insert_rowid() AS id').one().id;
-      j.q = id; str = JSON.stringify(j);                                                 // nomor urut: penonton yang sempat putus meminta yang tertinggal
-      sql.exec('UPDATE alat_log SET data = ? WHERE id = ?', str, id);
-      sql.exec('DELETE FROM alat_log WHERE id <= (SELECT MAX(id) FROM alat_log) - ?', MAKS_LOG_ALAT);
-      this.ctx.storage.setAlarm(Date.now() + UMUR_GAMBAR);
+      str = this.catat(kunci, j);
     }
     this.siarAlat(str);
   }
@@ -234,7 +340,7 @@ export class Ruang extends DurableObject {
         this.kirimJson(server, { t: 'penuh', maks }); server.close(4001, 'penuh'); return;
       }
       this.ctx.acceptWebSocket(server, ['al']);
-      this.kirimJson(server, this.keadaanAlat());
+      this.kirimJson(server, this.keadaanLengkap());
       return;
     }
     if (peran === 'host') {
@@ -256,6 +362,7 @@ export class Ruang extends DurableObject {
   async fetch(req) {
     const u = new URL(req.url);
     if (u.pathname === '/gambar') return this.gambar(req, u);
+    if (u.pathname === '/alat-isi') return this.isi(req, u);
     const peran = u.pathname === '/siar' ? 'host' : u.pathname === '/alat-siar' ? 'ah' : u.pathname === '/alat-dengar' ? 'al' : 'l';
     const pair = new WebSocketPair(), client = pair[0], server = pair[1];
     this.tambah(server, peran);
