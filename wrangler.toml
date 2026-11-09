@@ -1,0 +1,18 @@
+name = "live-kajian"
+main = "live-relay.js"
+compatibility_date = "2025-09-01"
+
+[[durable_objects.bindings]]
+name = "RUANG"
+class_name = "Ruang"
+
+# Paket Workers gratis hanya bisa memakai Durable Object berbasis SQLite → pakai new_sqlite_classes.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Ruang"]
+
+[vars]
+SUPABASE_URL = "https://mxucxnpccndtqvihgcwq.supabase.co"
+SUPABASE_ANON_KEY = "sb_publishable_8tRsjLV8rXmg1nhp5psD-Q_aXoIXWJ2"   # kunci publik yang sama dengan js/auth-config.js
+ALLOWED_ORIGINS = "https://qiladat.com,https://www.qiladat.com"        # tambahkan alamat uji bila perlu
+MAX_PENDENGAR = "80"
